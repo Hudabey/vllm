@@ -362,6 +362,7 @@ class TraceRing:
             raise ValueError("ring needs at least one slot and one row")
         self.k = k
         self.device = device
+        self.capacity_rows = capacity_rows
         pin = (device.type == "cuda") if pin_memory is None else pin_memory
         self.slots: list[RingSlot] = []
         for i in range(num_slots):
@@ -614,14 +615,23 @@ class TraceSession:
         if n == 0:
             return
         g = gather_scores(logits, topk_indices, row_starts, prefix_lens, self.k)
-        slot = self.ring.acquire(n)
-        slot.meta = meta
-        slot.step_id = ctx.step_id
-        slot.layer_id = layer_id
-        slot.phase = phase
-        slot.score_source = score_source
-        slot.ledger_edges = self.ledger.drain_pending()
-        self.ring.submit(slot, g)
+        cap = self.ring.capacity_rows
+        edges = self.ledger.drain_pending()
+        for start in range(0, n, cap):  # split batches larger than one slot
+            end = min(start + cap, n)
+            slot = self.ring.acquire(end - start)
+            slot.meta = meta[start:end]
+            slot.step_id = ctx.step_id
+            slot.layer_id = layer_id
+            slot.phase = phase
+            slot.score_source = score_source
+            slot.ledger_edges = edges
+            edges = []
+            part = g if (start == 0 and end == n) else Gathered(
+                g.ids[start:end], g.scores[start:end], g.tau[start:end],
+                g.valid_count[start:end], g.violations[start:end],
+                g.prefix_len[start:end])
+            self.ring.submit(slot, part)
         self.captures += 1
 
     # ---- lifecycle ------------------------------------------------------- #
