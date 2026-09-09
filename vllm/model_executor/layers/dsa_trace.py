@@ -28,6 +28,7 @@ Record layout (little endian, 64 + 8k bytes; 16,448 at k = 2048):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -99,6 +100,8 @@ class SampleMode(IntEnum):
     DECODE_ONLY = 1  # decode rows only; prefill captures are skipped entirely
     SAMPLED = 2  # decode rows; prefill rows with query_position % every == 0
     #               plus the final `tail` rows of each chunk
+    WINDOWED = 3  # only rows whose (request prompt hash, absolute query position) fall in
+    #               a configured window; applies to prefill and decode rows alike
 
     @classmethod
     def parse(cls, name: str) -> "SampleMode":
@@ -219,6 +222,13 @@ class RowMeta:
     query_token_id: int
     attempt_id: int = 0
     phase: int = Phase.PREFILL
+    prompt_hash: str = ""  # sha256 of the request's prompt token ids (int32 LE bytes)
+
+
+def prompt_hash_of(token_ids) -> str:
+    import numpy as _np
+    arr = _np.asarray(token_ids, dtype="<i4")
+    return hashlib.sha256(arr.tobytes()).hexdigest()
 
 
 @dataclass
@@ -636,8 +646,15 @@ class TraceSession:
         sample_mode: SampleMode | int = SampleMode.FULL,
         sample_every: int = 64,
         sample_tail: int = 256,
+        windows: dict[str, list[tuple[int, int]]] | None = None,
     ) -> None:
         self.out_dir = out_dir
+        # WINDOWED: prompt_hash -> list of inclusive [start, end] absolute query positions
+        self.windows: dict[str, list[tuple[int, int]]] = {
+            k: [(int(a), int(b)) for a, b in v] for k, v in (windows or {}).items()
+        }
+        self.window_rows_seen = 0
+        self.window_rows_captured = 0
         self.sample_mode = SampleMode(int(sample_mode))
         self.sample_every = int(sample_every)
         self.sample_tail = int(sample_tail)
@@ -694,7 +711,21 @@ class TraceSession:
             raise ValueError(f"{n} logits rows but {len(meta)} row metas")
         if n == 0:
             return
-        if phase == Phase.PREFILL and self.sample_mode != SampleMode.FULL:
+        if self.sample_mode == SampleMode.WINDOWED:
+            self.window_rows_seen += n
+            keep = self.windowed_rows(meta)
+            if not keep:
+                return
+            if len(keep) < n:
+                idx = torch.tensor(keep, dtype=torch.int64, device=logits.device)
+                logits = logits.index_select(0, idx)
+                topk_indices = topk_indices.index_select(0, idx)
+                row_starts = row_starts.index_select(0, idx)
+                prefix_lens = prefix_lens.index_select(0, idx)
+                meta = [meta[i] for i in keep]
+                n = len(keep)
+            self.window_rows_captured += n
+        elif phase == Phase.PREFILL and self.sample_mode != SampleMode.FULL:
             self.prefill_rows_seen += n
             if self.sample_mode == SampleMode.DECODE_ONLY:
                 return
@@ -730,6 +761,16 @@ class TraceSession:
                 g.prefix_len[start:end])
             self.ring.submit(slot, part)
         self.captures += 1
+
+    def windowed_rows(self, meta: Sequence[RowMeta]) -> list[int]:
+        """Row indices whose request prompt hash has a window containing the row's
+        absolute query position (host-side, O(rows x windows))."""
+        out = []
+        for i, m in enumerate(meta):
+            ws = self.windows.get(m.prompt_hash)
+            if ws and any(a <= m.query_position <= b for a, b in ws):
+                out.append(i)
+        return out
 
     def sampled_prefill_rows(self, meta: Sequence[RowMeta], n: int) -> list[int]:
         """Row indices kept in SAMPLED mode: query_position % sample_every == 0,
@@ -782,6 +823,9 @@ class TraceSession:
             "sample_every": self.sample_every,
             "sample_tail": self.sample_tail,
             "prefill_rows_seen": self.prefill_rows_seen,
+            "windows": {k: [list(w) for w in v] for k, v in self.windows.items()},
+            "window_rows_seen": self.window_rows_seen,
+            "window_rows_captured": self.window_rows_captured,
             "prefill_rows_captured": (
                 self.prefill_rows_captured
                 if self.sample_mode != SampleMode.FULL else None
@@ -835,9 +879,12 @@ class RowBuilder:
         self.ledger = ledger
         self.request_keys = request_keys
         self._cache: dict[str, tuple[int, int, int]] = {}  # req_id -> (covered, node, attempt)
+        self._prompt_hash: dict[str, str] = {}
+        self.prompt_hashes: dict[int, str] = {}  # request_key -> prompt hash (for the manifest)
 
     def forget(self, req_id: str) -> None:
         self._cache.pop(req_id, None)
+        self._prompt_hash.pop(req_id, None)
 
     def build(
         self,
@@ -846,6 +893,7 @@ class RowBuilder:
         num_computed: Sequence[int],
         token_ids_cpu,
         decode_threshold: int = 1,
+        num_prompt_tokens: Sequence[int] | None = None,
     ) -> list[RowMeta]:
         """``req_ids[i]`` owns rows ``token_ids_cpu[i, c:c+s]`` in batch order,
         where ``c = num_computed[i]`` and ``s = num_scheduled[i]``."""
@@ -862,11 +910,16 @@ class RowBuilder:
                 node = self.ledger.add(token_ids_cpu[i, :c]) if c > 0 else 0
             key = request_key(rid)
             self.request_keys.setdefault(key, rid)
+            ph = self._prompt_hash.get(rid, "")
+            if not ph and num_prompt_tokens is not None:
+                ph = prompt_hash_of(token_ids_cpu[i, : int(num_prompt_tokens[i])])
+                self._prompt_hash[rid] = ph
+                self.prompt_hashes[key] = ph
             toks = token_ids_cpu[i, c : c + s]
             path = self.ledger.add_path_from(node, toks)
             phase = Phase.DECODE if s <= decode_threshold else Phase.PREFILL
             for j in range(s):
-                rows.append(RowMeta(key, path[j], c + j, int(toks[j]), attempt, phase))
+                rows.append(RowMeta(key, path[j], c + j, int(toks[j]), attempt, phase, ph))
             self._cache[rid] = (c + s, path[-1], attempt)
         return rows
 
@@ -906,6 +959,12 @@ def session_from_env(
     ring_slots = int(os.environ.get("TOLLBOOTH_RING_SLOTS", "64"))
     cap = int(os.environ.get("TOLLBOOTH_CAPACITY_ROWS", str(capacity_rows)))
     mode = SampleMode.parse(os.environ.get("TOLLBOOTH_SAMPLE", "full"))
+    windows = None
+    wpath = os.environ.get("TOLLBOOTH_WINDOWS")
+    if wpath:
+        with open(wpath) as f:
+            windows = json.load(f)
+        mode = SampleMode.WINDOWED
     every = int(os.environ.get("TOLLBOOTH_SAMPLE_EVERY", "64"))
     tail = int(os.environ.get("TOLLBOOTH_SAMPLE_TAIL", "256"))
     return TraceSession(
@@ -921,6 +980,7 @@ def session_from_env(
         sample_mode=mode,
         sample_every=every,
         sample_tail=tail,
+        windows=windows,
     )
 
 

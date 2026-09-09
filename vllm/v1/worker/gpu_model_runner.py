@@ -6721,7 +6721,11 @@ class GPUModelRunner(
             num_scheduled_tokens_np[:num_reqs],
             self.input_batch.num_computed_tokens_cpu[:num_reqs],
             self.input_batch.token_ids_cpu,
+            num_prompt_tokens=self.input_batch.num_prompt_tokens[:num_reqs],
         )
+        session.manifest_extra["prompt_hashes"] = {
+            str(k): v for k, v in self._tollbooth_rows.prompt_hashes.items()
+        }
         if len(rows) != scheduler_output.total_num_scheduled_tokens:
             raise RuntimeError(
                 f"tollbooth: built {len(rows)} rows for "

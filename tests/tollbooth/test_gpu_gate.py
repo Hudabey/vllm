@@ -287,7 +287,8 @@ def make_batch(
     ledger = session.ledger if session is not None else dsa_trace.PrefixLedger()
     keys = session.request_keys if session is not None else {}
     rows = dsa_trace.RowBuilder(ledger, keys).build(
-        req_ids, num_scheduled, num_computed, token_ids
+        req_ids, num_scheduled, num_computed, token_ids,
+        num_prompt_tokens=[c + s for c, s in zip(num_computed, num_scheduled)],
     )
     assert len(rows) == T
 
@@ -1524,3 +1525,51 @@ def test_continuous_capture_benchmark(env, tmp_path_factory, mode):
     os.remove(session.records_path)  # tens of GB in full mode; manifest stays
     del batch, kv
     torch.cuda.empty_cache()
+
+
+def test_gate_windowed_capture(env, tmp_path_factory):
+    """First-replay support: SampleMode.WINDOWED through the real kernels. A mixed
+    batch (1 decode row at L=4096 + one 4096-row prefill) with windows on the decode
+    request's single position and on prefill positions [4000, 4095] of the prefill
+    request: exactly those rows are recorded, flagged WINDOWED, verbatim against the
+    live buffer, and the manifest counts rows seen vs captured."""
+    device = env.device
+    L = 4096
+    tdir = trace_dir(tmp_path_factory, "gate-windowed")
+    # prompt hashes are assigned by the RowBuilder from the batch's token ids; the gate's
+    # make_batch builds rows with the session's RowBuilder, so read them back from it
+    session = new_session(tdir, device, sample_mode=dsa_trace.SampleMode.WINDOWED, windows={})
+    batch = make_batch(env, [L], [L], seed=610, session=session)
+    hashes = {}
+    for r in batch.rows:
+        hashes.setdefault(r.request_key, r.prompt_hash)
+    dec_key = batch.rows[0].request_key
+    pre_key = batch.rows[-1].request_key
+    assert hashes[dec_key] and hashes[pre_key] and hashes[dec_key] != hashes[pre_key]
+    session.windows = {hashes[dec_key]: [(L - 1, L - 1)], hashes[pre_key]: [(4000, 4095)]}
+    T = batch.num_tokens
+    buf = torch.full((T, K), -1, dtype=torch.int32, device=device)
+    ctx = dsa_trace.TraceContext(run_id=1, step_id=0, tp_rank=0, tp_world_size=1, rows=batch.rows)
+    with LogitsSpy() as spy:
+        kv = batch.layers[0].kv_cache_base.clone()
+        run_layer(env, batch, 0, kv, buf, (session, ctx))
+        calls = spy.calls[:]
+    on = buf.clone()
+    session.close()
+    torch.cuda.synchronize()
+    rec = dsa_trace.read_records(session.records_path, K)
+    h = rec["header"]
+    assert len(rec) == 1 + 96
+    assert all(dsa_trace.sample_mode_of(int(f)) == dsa_trace.SampleMode.WINDOWED for f in h["flags"])
+    dec = (h["flags"] & dsa_trace.Flag.DECODE) != 0
+    assert int(dec.sum()) == 1 and int(h["query_position"][dec][0]) == L - 1
+    pre_pos = sorted(h["query_position"][~dec].tolist())
+    assert pre_pos == list(range(4000, 4096))
+    exp = expected_rows(batch, on, calls)
+    exp = [e for e in exp if (e.phase == dsa_trace.Phase.DECODE) or 4000 <= e.meta.query_position <= 4095]
+    f = check_records(rec, exp, 0, 0)
+    assert f["records"] == 97
+    m = json.load(open(session.manifest_path))
+    assert m["sample_mode"] == "windowed" and m["window_rows_seen"] == T and m["window_rows_captured"] == 97
+    assert read_trace_check(tdir) == 0
+    record_fact("gate_windowed", {"rows_seen": m["window_rows_seen"], "rows_captured": m["window_rows_captured"], "records": len(rec)})
