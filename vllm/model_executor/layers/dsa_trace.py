@@ -146,6 +146,14 @@ class PrefixLedger:
             out.append(node)
         return out
 
+    def add_path_from(self, node: int, tokens: Sequence[int]) -> list[int]:
+        """Extend an existing prefix node by ``tokens``; node id per new length."""
+        out = []
+        for token in tokens:
+            node = self.append(node, int(token))
+            out.append(node)
+        return out
+
     def tokens(self, node: int) -> list[int]:
         result: list[int] = []
         while node:
@@ -561,6 +569,7 @@ class TraceSession:
         self.device = torch.device(device)
         self.ring = TraceRing(ring_slots, capacity_rows, k, self.device, pin_memory)
         self.ledger = PrefixLedger()
+        self.request_keys: dict[int, str] = {}  # request_key -> engine request id
         self.fatal: BaseException | None = None
         self.manifest_extra = manifest_extra or {}
         self.captures = 0
@@ -655,9 +664,195 @@ class TraceSession:
             "started_unix": self._started,
             "finished_unix": time.time(),
             "fatal": repr(self.fatal) if self.fatal else None,
+            "request_keys": {str(k): v for k, v in self.request_keys.items()},
             **self.manifest_extra,
         }
         with open(self.manifest_path, "w") as f:
             json.dump(manifest, f, indent=2, sort_keys=True)
         if self.fatal is not None:
             raise TraceContractError("trace writer failed") from self.fatal
+
+
+# --------------------------------------------------------------------------- #
+# Host-side helpers used by the model runner and the indexer call sites
+# --------------------------------------------------------------------------- #
+
+
+def request_key(req_id: str) -> int:
+    """FNV-1a 64-bit of the engine request id; manifest maps it back."""
+    h = 0xCBF29CE484222325
+    for b in req_id.encode("utf-8"):
+        h ^= b
+        h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def layer_index_from_name(layer_name: str) -> int:
+    """'model.layers.17.self_attn.indexer.k_cache' -> 17 (first int component)."""
+    for part in layer_name.split("."):
+        if part.isdigit():
+            return int(part)
+    raise ValueError(f"no layer index in {layer_name!r}")
+
+
+class RowBuilder:
+    """Turns the model runner's per-forward batch layout into ``RowMeta`` rows.
+
+    Keeps, per request, the ledger node reached at ``num_computed_tokens`` so a
+    decode step costs one ledger append per new token instead of re-walking the
+    prefix. A request whose computed-token count went backwards (preemption,
+    recompute) gets ``attempt_id += 1`` and its prefix is re-interned from the
+    token ids, which yields the same nodes because interning is exact.
+    """
+
+    def __init__(self, ledger: PrefixLedger, request_keys: dict[int, str]) -> None:
+        self.ledger = ledger
+        self.request_keys = request_keys
+        self._cache: dict[str, tuple[int, int, int]] = {}  # req_id -> (covered, node, attempt)
+
+    def forget(self, req_id: str) -> None:
+        self._cache.pop(req_id, None)
+
+    def build(
+        self,
+        req_ids: Sequence[str],
+        num_scheduled: Sequence[int],
+        num_computed: Sequence[int],
+        token_ids_cpu,
+        decode_threshold: int = 1,
+    ) -> list[RowMeta]:
+        """``req_ids[i]`` owns rows ``token_ids_cpu[i, c:c+s]`` in batch order,
+        where ``c = num_computed[i]`` and ``s = num_scheduled[i]``."""
+        rows: list[RowMeta] = []
+        for i, rid in enumerate(req_ids):
+            s = int(num_scheduled[i])
+            if s <= 0:
+                continue
+            c = int(num_computed[i])
+            covered, node, attempt = self._cache.get(rid, (0, 0, 0))
+            if covered != c:
+                if covered > c:
+                    attempt += 1
+                node = self.ledger.add(token_ids_cpu[i, :c]) if c > 0 else 0
+            key = request_key(rid)
+            self.request_keys.setdefault(key, rid)
+            toks = token_ids_cpu[i, c : c + s]
+            path = self.ledger.add_path_from(node, toks)
+            phase = Phase.DECODE if s <= decode_threshold else Phase.PREFILL
+            for j in range(s):
+                rows.append(RowMeta(key, path[j], c + j, int(toks[j]), attempt, phase))
+            self._cache[rid] = (c + s, path[-1], attempt)
+        return rows
+
+
+_ACTIVE: tuple[TraceSession, TraceContext] | None = None
+
+
+def set_active(session: TraceSession, ctx: TraceContext) -> None:
+    global _ACTIVE
+    _ACTIVE = (session, ctx)
+
+
+def clear_active() -> None:
+    global _ACTIVE
+    _ACTIVE = None
+
+
+def get_active() -> tuple[TraceSession, TraceContext] | None:
+    """Layer-path lookup; None outside a traced forward (dummy runs, profiling,
+    graph capture) so every call site degrades to a no-op."""
+    return _ACTIVE
+
+
+def session_from_env(
+    tp_rank: int,
+    tp_world_size: int,
+    k: int,
+    device: torch.device | str,
+    capacity_rows: int,
+    manifest_extra: dict | None = None,
+) -> TraceSession | None:
+    """Build a session from TOLLBOOTH_* environment variables, or None."""
+    out_dir = os.environ.get("TOLLBOOTH_DIR")
+    if not out_dir:
+        return None
+    run_id = int(os.environ.get("TOLLBOOTH_RUN_ID", str(int(time.time()))))
+    ring_slots = int(os.environ.get("TOLLBOOTH_RING_SLOTS", "64"))
+    cap = int(os.environ.get("TOLLBOOTH_CAPACITY_ROWS", str(capacity_rows)))
+    return TraceSession(
+        out_dir,
+        run_id=run_id,
+        tp_rank=tp_rank,
+        tp_world_size=tp_world_size,
+        k=k,
+        device=device,
+        ring_slots=ring_slots,
+        capacity_rows=cap,
+        manifest_extra=manifest_extra,
+    )
+
+
+def capture_prefill_chunk(
+    trace: tuple[TraceSession, TraceContext],
+    layer_id: int,
+    logits: torch.Tensor,
+    topk_indices: torch.Tensor,
+    chunk,
+    score_source: int = ScoreSource.SELECTOR,
+) -> None:
+    """Call after the chunk's top-k (and any DCP merge). ``chunk`` is a
+    DeepseekV32IndexerPrefillChunkMetadata: rows are token rows
+    ``[token_start, token_end)``; ``cu_seqlen_ks/ke`` are per-row column bounds
+    of the causal window inside ``logits``."""
+    session, ctx = trace
+    n = chunk.token_end - chunk.token_start
+    ks = chunk.cu_seqlen_ks[:n]
+    ke = chunk.cu_seqlen_ke[:n]
+    session.capture(
+        ctx,
+        layer_id,
+        logits,
+        topk_indices,
+        row_starts=ks,
+        prefix_lens=ke - ks,
+        rows=slice(chunk.token_start, chunk.token_end),
+        phase=Phase.PREFILL,
+        score_source=score_source,
+    )
+
+
+def capture_decode(
+    trace: tuple[TraceSession, TraceContext],
+    layer_id: int,
+    logits: torch.Tensor,
+    topk_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_decode_tokens: int,
+    requires_padding: bool,
+) -> None:
+    """Call after the decode selector dispatch (and any DCP merge), before any
+    unpack. Decode rows are the first ``num_decode_tokens`` token rows of the
+    forward. Decode indices are request-local already, so row_starts = 0 and
+    prefix_lens = seq_lens (per row; 1-D (B,) or 2-D (B, next_n) flattened)."""
+    if num_decode_tokens <= 0:
+        return
+    if requires_padding:
+        raise NotImplementedError(
+            "tollbooth: padded decode rows (uneven decode_lens, i.e. speculative "
+            "decoding or short chunked prefills routed as decode) are outside the "
+            "traced configuration; run with next_n == 1"
+        )
+    session, ctx = trace
+    n = num_decode_tokens
+    prefix = seq_lens.reshape(-1)[:n]
+    session.capture(
+        ctx,
+        layer_id,
+        logits[:n],
+        topk_indices[:n],
+        row_starts=torch.zeros(n, dtype=torch.int32, device=logits.device),
+        prefix_lens=prefix,
+        rows=slice(0, n),
+        phase=Phase.DECODE,
+        score_source=ScoreSource.SELECTOR,
+    )

@@ -60,6 +60,8 @@ from vllm.forward_context import (
 from vllm.logger import init_logger
 from vllm.lora.layers import BaseLayerWithLoRA, LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers import dsa_trace
+from vllm.version import __version__ as vllm_version
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -553,6 +555,11 @@ class GPUModelRunner(
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
+        # tollbooth: exact DSA indexer selection trace (armed by TOLLBOOTH_DIR).
+        self._tollbooth: dsa_trace.TraceSession | None = None
+        self._tollbooth_rows: dsa_trace.RowBuilder | None = None
+        self._tollbooth_step = 0
+        self._tollbooth_checked = False
         self.max_num_reqs = scheduler_config.max_num_seqs
 
         # Broadcast PP output for external_launcher (torchrun)
@@ -1213,6 +1220,8 @@ class GPUModelRunner(
         """
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
+            if self._tollbooth_rows is not None:
+                self._tollbooth_rows.forget(req_id)
             req_state = self.requests.pop(req_id, None)
             self._on_request_state_removed(req_id, req_state)
             self.num_prompt_logprobs.pop(req_id, None)
@@ -1226,6 +1235,8 @@ class GPUModelRunner(
         # distinct requests - clearing the cached states for the first request
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
+            if self._tollbooth_rows is not None:
+                self._tollbooth_rows.forget(req_id)
             self.input_batch.remove_request(req_id)
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
@@ -4355,6 +4366,9 @@ class GPUModelRunner(
             logits_indices, spec_decode_metadata, max_num_sampled_tokens = (
                 self._prepare_inputs(scheduler_output, num_scheduled_tokens_np)
             )
+            tollbooth_ctx = self._tollbooth_context(
+                scheduler_output, num_scheduled_tokens_np
+            )
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -4547,13 +4561,20 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            if tollbooth_ctx is not None:
+                assert self._tollbooth is not None
+                dsa_trace.set_active(self._tollbooth, tollbooth_ctx)
+            try:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+            finally:
+                if tollbooth_ctx is not None:
+                    dsa_trace.clear_active()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -6641,9 +6662,89 @@ class GPUModelRunner(
 
     _freeze_gc = staticmethod(freeze_gc_for_cudagraph_capture)
 
+    def _tollbooth_init(self) -> None:
+        self._tollbooth_checked = True
+        k = getattr(self.model_config.hf_text_config, "index_topk", None)
+        if k is None:
+            return
+        tp = get_tp_group()
+        self._tollbooth = dsa_trace.session_from_env(
+            tp_rank=tp.rank_in_group,
+            tp_world_size=tp.world_size,
+            k=int(k),
+            device=self.device,
+            capacity_rows=self.max_num_tokens,
+            manifest_extra={
+                "model": self.model_config.model,
+                "vllm_version": vllm_version,
+                "num_hidden_layers": getattr(
+                    self.model_config.hf_text_config, "num_hidden_layers", None
+                ),
+                "max_model_len": self.model_config.max_model_len,
+                "max_num_batched_tokens": self.max_num_tokens,
+            },
+        )
+        if self._tollbooth is not None:
+            self._tollbooth_rows = dsa_trace.RowBuilder(
+                self._tollbooth.ledger, self._tollbooth.request_keys
+            )
+            logger.info(
+                "tollbooth: tracing DSA indexer selection to %s (rank %d, k=%d)",
+                self._tollbooth.out_dir,
+                tp.rank_in_group,
+                int(k),
+            )
+
+    def _tollbooth_context(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_scheduled_tokens_np: np.ndarray,
+    ) -> dsa_trace.TraceContext | None:
+        """Per-forward row ownership for the trace; None when tracing is off.
+        Must run after batch reordering and _prepare_inputs so batch order,
+        computed-token counts and token ids are final for this forward."""
+        if not self._tollbooth_checked:
+            self._tollbooth_init()
+        session = self._tollbooth
+        if session is None:
+            return None
+        assert self._tollbooth_rows is not None
+        if scheduler_output.scheduled_spec_decode_tokens:
+            raise NotImplementedError(
+                "tollbooth: speculative decoding is outside the traced configuration"
+            )
+        if self.parallel_config.use_ubatching:
+            raise NotImplementedError("tollbooth: micro-batching is not supported")
+        num_reqs = self.input_batch.num_reqs
+        rows = self._tollbooth_rows.build(
+            self.input_batch.req_ids[:num_reqs],
+            num_scheduled_tokens_np[:num_reqs],
+            self.input_batch.num_computed_tokens_cpu[:num_reqs],
+            self.input_batch.token_ids_cpu,
+        )
+        if len(rows) != scheduler_output.total_num_scheduled_tokens:
+            raise RuntimeError(
+                f"tollbooth: built {len(rows)} rows for "
+                f"{scheduler_output.total_num_scheduled_tokens} scheduled tokens"
+            )
+        step_id = self._tollbooth_step
+        self._tollbooth_step += 1
+        return dsa_trace.TraceContext(
+            run_id=session.run_id,
+            step_id=step_id,
+            tp_rank=session.tp_rank,
+            tp_world_size=session.tp_world_size,
+            rows=rows,
+        )
+
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
+        if self._tollbooth is not None:
+            try:
+                self._tollbooth.close()
+            finally:
+                self._tollbooth = None
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
 

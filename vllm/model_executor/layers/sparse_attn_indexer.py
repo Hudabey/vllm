@@ -13,6 +13,7 @@ from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers import dsa_trace
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
@@ -293,6 +294,105 @@ def kv_cache_as_quant_view(
 
 
 @eager_break_during_capture
+def _shadow_prefill_capture(
+    trace,
+    layer_id: int,
+    attn_metadata_narrowed,
+    kv_cache: torch.Tensor,
+    q_quant: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    weights: torch.Tensor,
+    topk_tokens: int,
+    head_dim: int,
+    total_seq_lens: int,
+    fp8_dtype: torch.dtype,
+    use_fp4_cache: bool,
+    dcp_rank: int,
+    dcp_world_size: int,
+    cp_kv_cache_interleave_size: int,
+) -> None:
+    """tollbooth: score a dense-MHA-bypassed prefill into scratch and record it.
+
+    Mirrors the live prefill chunk loop in ``sparse_attn_indexer`` exactly,
+    except that top-k lands in a fresh scratch tensor. The live
+    ``topk_indices_buffer`` and the dense attention path are never touched;
+    records are flagged ``score_source = shadow_dense``.
+    """
+    prefill_metadata = attn_metadata_narrowed.prefill
+    if prefill_metadata is None:
+        return
+    workspace_manager = current_workspace_manager()
+    values_spec, scales_spec = _gather_workspace_shapes(
+        total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+    )
+    k_quant_full, k_scale_full = workspace_manager.get_simultaneous(
+        values_spec, scales_spec
+    )
+    for chunk in prefill_metadata.chunks:
+        cu_seqlen_ks = chunk.cu_seqlen_ks
+        cu_seqlen_ke = chunk.cu_seqlen_ke
+        assert chunk.local_cu_seq_lens is not None
+        k_quant = k_quant_full[: chunk.max_local_total_seq_lens]
+        k_scale = k_scale_full[: chunk.max_local_total_seq_lens]
+        if not chunk.skip_kv_gather and chunk.local_total_seq_lens > 0:
+            ops.cp_gather_indexer_k_quant_cache(
+                kv_cache, k_quant, k_scale, chunk.block_table, chunk.local_cu_seq_lens
+            )
+        q_slice = q_quant[chunk.token_start : chunk.token_end]
+        q_scale_slice = (
+            q_scale[chunk.token_start : chunk.token_end] if q_scale is not None else None
+        )
+        topk_indices = torch.full(
+            (q_slice.shape[0], topk_tokens), -1, dtype=torch.int32, device=q_slice.device
+        )
+        if chunk.local_total_seq_lens == 0:
+            logits = q_slice.new_empty((q_slice.shape[0], 0), dtype=torch.float32)
+        else:
+            if use_fp4_cache:
+                q_slice_cast = q_slice.view(torch.int8)
+                k_quant_cast = k_quant.view(torch.int8)
+                k_scale_cast = k_scale.view(torch.int32).squeeze(-1)
+            else:
+                q_slice_cast = q_slice
+                k_quant_cast = k_quant
+                k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
+            logits = fp8_fp4_mqa_logits(
+                (q_slice_cast, q_scale_slice),
+                (k_quant_cast, k_scale_cast),
+                weights[chunk.token_start : chunk.token_end],
+                cu_seqlen_ks,
+                cu_seqlen_ke,
+                clean_logits=False,
+            )
+            ops.top_k_per_row_prefill(
+                logits,
+                cu_seqlen_ks,
+                cu_seqlen_ke,
+                topk_indices,
+                logits.shape[0],
+                logits.stride(0),
+                logits.stride(1),
+                topk_tokens,
+            )
+        _merge_dcp_topk_global(
+            logits,
+            topk_indices,
+            topk_tokens,
+            dcp_rank,
+            dcp_world_size,
+            cp_kv_cache_interleave_size,
+            row_starts=chunk.cu_seqlen_ks,
+        )
+        dsa_trace.capture_prefill_chunk(
+            trace,
+            layer_id,
+            logits,
+            topk_indices,
+            chunk,
+            score_source=dsa_trace.ScoreSource.SHADOW_DENSE,
+        )
+
+
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -368,6 +468,11 @@ def sparse_attn_indexer(
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
+    # tollbooth: None unless the model runner armed a trace for this forward.
+    trace = dsa_trace.get_active()
+    trace_layer = (
+        dsa_trace.layer_index_from_name(k_cache_prefix) if trace is not None else -1
+    )
 
     # q_scale is required iff the FP4 cache path is enabled; the FP8 path
     # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
@@ -421,6 +526,24 @@ def sparse_attn_indexer(
                 # Deliberately leave the buffer untouched. Dense MHA does not
                 # consume top-k indices for this batch; clearing it would be
                 # unnecessary work.
+                if trace is not None:
+                    _shadow_prefill_capture(
+                        trace,
+                        trace_layer,
+                        attn_metadata_narrowed,
+                        kv_cache,
+                        q_quant,
+                        q_scale,
+                        weights,
+                        topk_tokens,
+                        head_dim,
+                        total_seq_lens,
+                        fp8_dtype,
+                        use_fp4_cache,
+                        dcp_rank,
+                        dcp_world_size,
+                        cp_kv_cache_interleave_size,
+                    )
                 return topk_indices_buffer
 
     # The buffer must be pre-filled with -1 (the "no token" sentinel) before the
@@ -526,6 +649,10 @@ def sparse_attn_indexer(
                 cp_kv_cache_interleave_size,
                 row_starts=chunk.cu_seqlen_ks,
             )
+            if trace is not None:
+                dsa_trace.capture_prefill_chunk(
+                    trace, trace_layer, logits, topk_indices, chunk
+                )
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -673,6 +800,17 @@ def sparse_attn_indexer(
                 dcp_rank,
                 dcp_world_size,
                 cp_kv_cache_interleave_size,
+            )
+
+        if trace is not None:
+            dsa_trace.capture_decode(
+                trace,
+                trace_layer,
+                logits,
+                topk_indices,
+                seq_lens,
+                num_decode_tokens,
+                decode_metadata.requires_padding,
             )
 
         if decode_metadata.requires_padding:

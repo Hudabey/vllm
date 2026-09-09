@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -290,3 +291,126 @@ def test_deepseek_v32_dispatches_selected_mha(
             expected_args[1:],
         )
     )
+
+
+def test_dense_bypass_shadow_scores_into_scratch_and_records(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """tollbooth: with a trace armed, the dense short-prefill bypass must still
+    return the live buffer untouched, and the trace must hold shadow-flagged
+    records whose ids equal the selector's output on the same logits."""
+    from vllm.model_executor.layers import dsa_trace
+
+    rows, cols, k = 3, 6, 4
+    chunk = SimpleNamespace(
+        token_start=0,
+        token_end=rows,
+        cu_seqlen_ks=torch.tensor([0, 0, 0], dtype=torch.int32),
+        cu_seqlen_ke=torch.tensor([1, 2, 3], dtype=torch.int32),
+        local_cu_seq_lens=torch.zeros(2, dtype=torch.int32),
+        local_total_seq_lens=3,
+        max_local_total_seq_lens=3,
+        skip_kv_gather=True,
+        block_table=torch.empty(0, dtype=torch.int32),
+    )
+    indexer_metadata = make_indexer_metadata(
+        num_prefills=1,
+        num_prefill_tokens=rows,
+        slot_mapping=torch.zeros(rows, dtype=torch.long),
+    )
+    indexer_metadata.prefill = SimpleNamespace(chunks=[chunk])
+    mla_metadata = make_mla_metadata(use_dense_mha=True, num_decode_tokens=0)
+    monkeypatch.setattr(
+        sparse_indexer,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={INDEXER_LAYER: indexer_metadata, MLA_LAYER: mla_metadata},
+            cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+        ),
+    )
+    monkeypatch.setattr(
+        sparse_indexer.current_platform, "fp8_dtype", lambda: torch.float16
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        sparse_indexer.ops, "indexer_k_quant_and_cache", lambda *a, **kw: None
+    )
+    monkeypatch.setattr(
+        sparse_indexer, "_gather_workspace_shapes", lambda *a, **kw: (None, None)
+    )
+    monkeypatch.setattr(
+        sparse_indexer,
+        "current_workspace_manager",
+        lambda: SimpleNamespace(
+            get_simultaneous=lambda *specs: tuple(
+                torch.empty(0, dtype=torch.float32) for _ in specs
+            )
+        ),
+    )
+    nan = float("nan")
+    synthetic = torch.tensor(
+        [
+            [5.0, nan, nan, nan, nan, nan],
+            [1.0, 7.0, nan, nan, nan, nan],
+            [3.0, 3.0, 9.0, nan, nan, nan],
+        ]
+    )
+    monkeypatch.setattr(
+        sparse_indexer, "fp8_fp4_mqa_logits", lambda *a, **kw: synthetic
+    )
+
+    def fake_topk(logits, ks, ke, out, num_rows, s0, s1, topk):
+        for r in range(num_rows):
+            n = int(ke[r]) - int(ks[r])
+            order = torch.argsort(logits[r, : n], descending=True, stable=True)
+            out[r, : min(n, topk)] = order[:topk].to(torch.int32)
+
+    monkeypatch.setattr(sparse_indexer.ops, "top_k_per_row_prefill", fake_topk)
+
+    session = dsa_trace.TraceSession(
+        str(tmp_path), run_id=1, tp_rank=0, tp_world_size=1, k=k,
+        device="cpu", pin_memory=False, ring_slots=2, capacity_rows=8,
+    )
+    nodes = session.ledger.add_path([10, 11, 12])
+    ctx = dsa_trace.TraceContext(
+        run_id=1, step_id=0, tp_rank=0, tp_world_size=1,
+        rows=[dsa_trace.RowMeta(1, nodes[p], p, 10 + p) for p in range(rows)],
+    )
+    live = torch.full((rows, k), 17, dtype=torch.int32)
+    dsa_trace.set_active(session, ctx)
+    try:
+        result = sparse_indexer.sparse_attn_indexer(
+            torch.full((rows, 1), float("inf")),
+            INDEXER_LAYER,
+            torch.empty(1),
+            torch.full((rows, 1), float("inf")),
+            None,
+            torch.arange(rows * 4, dtype=torch.float32).reshape(rows, 4),
+            torch.full((rows, 1), float("inf")),
+            128,
+            "ue8m0",
+            k,
+            4,
+            4096,
+            4096,
+            live,
+            False,
+            False,
+            MLA_LAYER,
+        )
+    finally:
+        dsa_trace.clear_active()
+    session.close()
+
+    assert result is live
+    assert torch.all(live == 17)  # live selection untouched by shadow scoring
+    rec = dsa_trace.read_records(session.records_path, k)
+    hdr = rec["header"]
+    assert len(rec) == rows
+    assert all(hdr["flags"] & dsa_trace.Flag.SHADOW)
+    assert not any(hdr["flags"] & dsa_trace.Flag.VIOLATION)
+    assert hdr["layer_id"].tolist() == [0, 0, 0]
+    assert hdr["valid_count"].tolist() == [1, 2, 3]
+    assert rec["ids"][2, :3].tolist() == [2, 0, 1]  # stable tie order preserved
+    assert rec["scores"][2, :3].tolist() == [9.0, 3.0, 3.0]
+    assert all(math.isnan(t) for t in hdr["tau"])  # every prefix shorter than k
