@@ -293,7 +293,6 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
-@eager_break_during_capture
 def _shadow_prefill_capture(
     trace,
     layer_id: int,
@@ -340,10 +339,15 @@ def _shadow_prefill_capture(
             )
         q_slice = q_quant[chunk.token_start : chunk.token_end]
         q_scale_slice = (
-            q_scale[chunk.token_start : chunk.token_end] if q_scale is not None else None
+            q_scale[chunk.token_start : chunk.token_end]
+            if q_scale is not None
+            else None
         )
         topk_indices = torch.full(
-            (q_slice.shape[0], topk_tokens), -1, dtype=torch.int32, device=q_slice.device
+            (q_slice.shape[0], topk_tokens),
+            -1,
+            dtype=torch.int32,
+            device=q_slice.device,
         )
         if chunk.local_total_seq_lens == 0:
             logits = q_slice.new_empty((q_slice.shape[0], 0), dtype=torch.float32)
@@ -393,6 +397,7 @@ def _shadow_prefill_capture(
         )
 
 
+@eager_break_during_capture
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,

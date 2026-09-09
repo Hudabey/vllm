@@ -362,18 +362,28 @@ def test_dense_bypass_shadow_scores_into_scratch_and_records(
     def fake_topk(logits, ks, ke, out, num_rows, s0, s1, topk):
         for r in range(num_rows):
             n = int(ke[r]) - int(ks[r])
-            order = torch.argsort(logits[r, : n], descending=True, stable=True)
+            order = torch.argsort(logits[r, :n], descending=True, stable=True)
             out[r, : min(n, topk)] = order[:topk].to(torch.int32)
 
     monkeypatch.setattr(sparse_indexer.ops, "top_k_per_row_prefill", fake_topk)
 
     session = dsa_trace.TraceSession(
-        str(tmp_path), run_id=1, tp_rank=0, tp_world_size=1, k=k,
-        device="cpu", pin_memory=False, ring_slots=2, capacity_rows=8,
+        str(tmp_path),
+        run_id=1,
+        tp_rank=0,
+        tp_world_size=1,
+        k=k,
+        device="cpu",
+        pin_memory=False,
+        ring_slots=2,
+        capacity_rows=8,
     )
     nodes = session.ledger.add_path([10, 11, 12])
     ctx = dsa_trace.TraceContext(
-        run_id=1, step_id=0, tp_rank=0, tp_world_size=1,
+        run_id=1,
+        step_id=0,
+        tp_rank=0,
+        tp_world_size=1,
         rows=[dsa_trace.RowMeta(1, nodes[p], p, 10 + p) for p in range(rows)],
     )
     live = torch.full((rows, k), 17, dtype=torch.int32)
@@ -414,3 +424,21 @@ def test_dense_bypass_shadow_scores_into_scratch_and_records(
     assert rec["ids"][2, :3].tolist() == [2, 0, 1]  # stable tie order preserved
     assert rec["scores"][2, :3].tolist() == [9.0, 3.0, 3.0]
     assert all(math.isnan(t) for t in hdr["tau"])  # every prefix shorter than k
+
+
+def test_sparse_attn_indexer_keeps_eager_break_decorator() -> None:
+    """tollbooth: the shadow-scoring helper was inserted between
+    ``@eager_break_during_capture`` and ``def sparse_attn_indexer`` and silently
+    took the decorator with it. The break point must stay on the custom-op
+    kernel (the helper runs inside it, in the same eager segment)."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(sparse_indexer))
+    decorators = {
+        node.name: [ast.unparse(d) for d in node.decorator_list]
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    assert "eager_break_during_capture" in decorators["sparse_attn_indexer"]
+    assert "eager_break_during_capture" not in decorators["_shadow_prefill_capture"]
