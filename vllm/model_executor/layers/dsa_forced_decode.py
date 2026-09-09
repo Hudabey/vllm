@@ -8,7 +8,7 @@ engine appends it to the request and advances the KV cache through the normal de
 one token per step. Nothing is pre-filled from the continuation; nothing is replaced after
 the fact. The model's own preferred token is irrelevant.
 
-Registration: ``LLM(..., logits_processors=["vllm.model_executor.layers.dsa_forced_decode.ForcedSequenceLogitsProcessor"])``.
+Registration: ``LLM(..., logits_processors=["vllm.model_executor.layers.dsa_forced_decode:ForcedSequenceLogitsProcessor"])``.
 
 Use ``max_tokens=len(forced_tokens)`` and ``ignore_eos=True`` so a forced end-of-sentence
 token inside the sequence does not stop generation early; ``temperature=0``.
