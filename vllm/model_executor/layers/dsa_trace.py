@@ -29,6 +29,7 @@ Record layout (little endian, 64 + 8k bytes; 16,448 at k = 2048):
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import struct
@@ -86,6 +87,26 @@ class Flag(IntEnum):
     SHADOW = 2  # score_source: 0 selector, 1 shadow_dense
     TAU_VALID = 4
     VIOLATION = 8  # contract violation detected on device for this row
+    # bits 4-5: SampleMode of the run that produced the record (see SAMPLE_SHIFT)
+
+
+SAMPLE_SHIFT = 4
+SAMPLE_MASK = 0x3 << SAMPLE_SHIFT
+
+
+class SampleMode(IntEnum):
+    FULL = 0  # every row of every capture
+    DECODE_ONLY = 1  # decode rows only; prefill captures are skipped entirely
+    SAMPLED = 2  # decode rows; prefill rows with query_position % every == 0
+    #               plus the final `tail` rows of each chunk
+
+    @classmethod
+    def parse(cls, name: str) -> "SampleMode":
+        return cls[name.strip().upper()]
+
+
+def sample_mode_of(flags: int) -> SampleMode:
+    return SampleMode((int(flags) & SAMPLE_MASK) >> SAMPLE_SHIFT)
 
 
 class Phase(IntEnum):
@@ -340,6 +361,7 @@ class RingSlot:
     layer_id: int = 0
     phase: int = Phase.PREFILL
     score_source: int = ScoreSource.SELECTOR
+    sample_mode: int = SampleMode.FULL
     ledger_edges: list[tuple[int, int, int]] = field(default_factory=list)
     device_refs: tuple = ()  # keeps Gathered tensors alive until copy_event completes
     state: SlotState = SlotState.FREE
@@ -388,22 +410,66 @@ class TraceRing:
         self._inflight: list[RingSlot] = []
         self._lock = threading.Lock()
         self.stalls = 0
+        self.failed: BaseException | None = None  # set by fail(); acquire raises
+        self.max_queued = 0
+        self._occ_sum = 0
+        self._occ_n = 0
         self.copy_stream = torch.cuda.Stream() if device.type == "cuda" else None
+
+    def fail(self, exc: BaseException) -> None:
+        """Mark the ring broken (writer died). Every slot still queued is
+        released so a producer blocked on a free slot wakes up and sees the
+        failure instead of waiting forever."""
+        if self.failed is None:
+            self.failed = exc
+        while True:
+            try:
+                slot = self.queued.get_nowait()
+            except queue.Empty:
+                break
+            if slot is not None:
+                self.release(slot)
+
+    def _raise_if_failed(self) -> None:
+        if self.failed is not None:
+            raise TraceContractError(
+                "trace writer failed; ring is closed"
+            ) from self.failed
+
+    def occupancy(self) -> dict:
+        return {
+            "max_queued": self.max_queued,
+            "mean_queued_at_submit": (self._occ_sum / self._occ_n) if self._occ_n else 0.0,
+            "submits": self._occ_n,
+            "stalls": self.stalls,
+        }
 
     def acquire(self, rows: int) -> RingSlot:
         if rows > self.slots[0].capacity_rows:
             raise ValueError(f"{rows} rows exceed slot capacity {self.slots[0].capacity_rows}")
+        self._raise_if_failed()
         try:
             slot = self._free.get_nowait()
         except queue.Empty:
             # Backpressure: wait for the oldest in-flight copy, then for the
             # writer to release a slot. Blocks on an event, never on .item().
+            # The wait is bounded per iteration so a writer failure (which
+            # releases every queued slot and sets self.failed) is observed.
             self.stalls += 1
             with self._lock:
                 oldest = self._inflight[0] if self._inflight else None
             if oldest is not None:
                 oldest.copy_event.synchronize()
-            slot = self._free.get()
+            while True:
+                self._raise_if_failed()
+                try:
+                    slot = self._free.get(timeout=0.05)
+                    break
+                except queue.Empty:
+                    continue
+        if self.failed is not None:
+            self._free.put(slot)
+            self._raise_if_failed()
         slot.state = SlotState.FILLING
         slot.rows = rows
         return slot
@@ -438,6 +504,10 @@ class TraceRing:
         slot.state = SlotState.QUEUED
         with self._lock:
             self._inflight.append(slot)
+        q = self.queued.qsize()
+        self.max_queued = max(self.max_queued, q + 1)
+        self._occ_sum += q
+        self._occ_n += 1
         self.queued.put(slot)
 
     def release(self, slot: RingSlot) -> None:
@@ -490,6 +560,7 @@ def serialize_slot(slot: RingSlot, run_id: int, tp_rank: int, k: int) -> tuple[b
         flags |= np.uint16(Flag.SHADOW)
     flags |= np.where(valid == k, np.uint16(Flag.TAU_VALID), np.uint16(0))
     flags |= np.where(viol > 0, np.uint16(Flag.VIOLATION), np.uint16(0))
+    flags |= np.uint16(int(slot.sample_mode) << SAMPLE_SHIFT)
     hdr["flags"] = flags
     rec["ids"] = slot.h_ids[:n].numpy()
     rec["scores"] = slot.h_scores[:n].numpy()
@@ -541,6 +612,7 @@ class TraceWriter(threading.Thread):
             except BaseException as e:  # noqa: BLE001
                 self.s.fatal = e
                 ring.release(slot)
+                ring.fail(e)  # unblock any producer waiting on a slot
                 break
             ring.release(slot)
 
@@ -561,8 +633,16 @@ class TraceSession:
         capacity_rows: int = 8192,
         pin_memory: bool | None = None,
         manifest_extra: dict | None = None,
+        sample_mode: SampleMode | int = SampleMode.FULL,
+        sample_every: int = 64,
+        sample_tail: int = 256,
     ) -> None:
         self.out_dir = out_dir
+        self.sample_mode = SampleMode(int(sample_mode))
+        self.sample_every = int(sample_every)
+        self.sample_tail = int(sample_tail)
+        self.prefill_rows_seen = 0
+        self.prefill_rows_captured = 0
         self.run_id = run_id
         self.tp_rank = tp_rank
         self.tp_world_size = tp_world_size
@@ -614,6 +694,22 @@ class TraceSession:
             raise ValueError(f"{n} logits rows but {len(meta)} row metas")
         if n == 0:
             return
+        if phase == Phase.PREFILL and self.sample_mode != SampleMode.FULL:
+            self.prefill_rows_seen += n
+            if self.sample_mode == SampleMode.DECODE_ONLY:
+                return
+            keep = self.sampled_prefill_rows(meta, n)
+            if len(keep) == 0:
+                return
+            if len(keep) < n:
+                idx = torch.tensor(keep, dtype=torch.int64, device=logits.device)
+                logits = logits.index_select(0, idx)
+                topk_indices = topk_indices.index_select(0, idx)
+                row_starts = row_starts.index_select(0, idx)
+                prefix_lens = prefix_lens.index_select(0, idx)
+                meta = [meta[i] for i in keep]
+                n = len(keep)
+            self.prefill_rows_captured += n
         g = gather_scores(logits, topk_indices, row_starts, prefix_lens, self.k)
         cap = self.ring.capacity_rows
         edges = self.ledger.drain_pending()
@@ -625,6 +721,7 @@ class TraceSession:
             slot.layer_id = layer_id
             slot.phase = phase
             slot.score_source = score_source
+            slot.sample_mode = self.sample_mode
             slot.ledger_edges = edges
             edges = []
             part = g if (start == 0 and end == n) else Gathered(
@@ -633,6 +730,16 @@ class TraceSession:
                 g.prefix_len[start:end])
             self.ring.submit(slot, part)
         self.captures += 1
+
+    def sampled_prefill_rows(self, meta: Sequence[RowMeta], n: int) -> list[int]:
+        """Row indices kept in SAMPLED mode: query_position % sample_every == 0,
+        plus the final sample_tail rows of the chunk (host-side, O(n))."""
+        first_tail = max(0, n - self.sample_tail)
+        every = self.sample_every
+        return [
+            i for i, m in enumerate(meta)
+            if i >= first_tail or (m.query_position % every == 0)
+        ]
 
     # ---- lifecycle ------------------------------------------------------- #
 
@@ -670,6 +777,15 @@ class TraceSession:
             "bytes_written": self.writer.bytes_written,
             "captures": self.captures,
             "ring_stalls": self.ring.stalls,
+            "ring_occupancy": self.ring.occupancy(),
+            "sample_mode": self.sample_mode.name.lower(),
+            "sample_every": self.sample_every,
+            "sample_tail": self.sample_tail,
+            "prefill_rows_seen": self.prefill_rows_seen,
+            "prefill_rows_captured": (
+                self.prefill_rows_captured
+                if self.sample_mode != SampleMode.FULL else None
+            ),
             "ledger_nodes": len(self.ledger.nodes),
             "started_unix": self._started,
             "finished_unix": time.time(),
@@ -789,6 +905,9 @@ def session_from_env(
     run_id = int(os.environ.get("TOLLBOOTH_RUN_ID", str(int(time.time()))))
     ring_slots = int(os.environ.get("TOLLBOOTH_RING_SLOTS", "64"))
     cap = int(os.environ.get("TOLLBOOTH_CAPACITY_ROWS", str(capacity_rows)))
+    mode = SampleMode.parse(os.environ.get("TOLLBOOTH_SAMPLE", "full"))
+    every = int(os.environ.get("TOLLBOOTH_SAMPLE_EVERY", "64"))
+    tail = int(os.environ.get("TOLLBOOTH_SAMPLE_TAIL", "256"))
     return TraceSession(
         out_dir,
         run_id=run_id,
@@ -799,6 +918,9 @@ def session_from_env(
         ring_slots=ring_slots,
         capacity_rows=cap,
         manifest_extra=manifest_extra,
+        sample_mode=mode,
+        sample_every=every,
+        sample_tail=tail,
     )
 
 
@@ -866,3 +988,71 @@ def capture_decode(
         phase=Phase.DECODE,
         score_source=ScoreSource.SELECTOR,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Validation helper (offline and test use only; never on the layer path)
+# --------------------------------------------------------------------------- #
+
+
+def validate_topk_row(
+    window_scores, ids, scores, tau: float, k: int
+) -> list[str]:
+    """Check one record against the live scores of its causal window.
+
+    ``window_scores``: f32 [prefix_len] scores of every key the selector saw;
+    ``ids``/``scores``: the record's int32[k] / f32[k]; ``tau``: the record's
+    tau. Returns a list of problems (empty == valid). Enforces, when
+    prefix_len >= k:
+      (a) selected score multiset == true top-k score multiset,
+      (b) every id scoring strictly above tau is selected,
+      (c) #selected strictly above tau + #selected at tau == k,
+      (d) ids unique and in range, scores == window[ids] bitwise,
+          min(selected) == tau.
+    Any choice among ids tied at tau is accepted; [10, 9, 9] with k=2 selecting
+    both 9s is rejected by (a) and (b).
+    """
+    problems: list[str] = []
+    w = np.asarray(window_scores, dtype=np.float32)
+    ids = np.asarray(ids, dtype=np.int32)
+    sc = np.asarray(scores, dtype=np.float32)
+    prefix_len = int(w.shape[0])
+    valid = ids >= 0
+    sel = ids[valid]
+    ssc = sc[valid]
+    if not np.all(np.isnan(sc[~valid])):
+        problems.append("non-NaN score at a -1 slot")
+    if len(np.unique(sel)) != len(sel):
+        problems.append("duplicate ids")
+    if len(sel) and (sel.min() < 0 or sel.max() >= prefix_len):
+        problems.append("id outside prefix")
+        return problems
+    if not np.array_equal(ssc.view(np.uint32), w[sel].view(np.uint32)):
+        problems.append("score != window score at id (bitwise)")
+    expect_n = min(k, prefix_len)
+    if len(sel) != expect_n:
+        problems.append(f"valid_count {len(sel)} != min(k, prefix_len) {expect_n}")
+        return problems
+    if prefix_len < k:
+        if not math.isnan(tau):
+            problems.append("tau must be NaN for a prefix shorter than k")
+        if set(sel.tolist()) != set(range(prefix_len)):
+            problems.append("short prefix must select every position")
+        return problems
+    top = np.sort(w)[::-1][:k]
+    if not np.array_equal(np.sort(ssc)[::-1].view(np.uint32), top.view(np.uint32)):
+        problems.append("(a) selected score multiset != true top-k multiset")
+    if math.isnan(tau) or np.float32(tau).view(np.uint32) != ssc.min().view(np.uint32):
+        problems.append("(d) tau != min(selected scores)")
+        return problems
+    t = np.float32(tau)
+    above = np.nonzero(w > t)[0]
+    if not np.isin(above, sel).all():
+        problems.append("(b) an id scoring strictly above tau is not selected")
+    n_above = int((ssc > t).sum())
+    n_at = int((ssc == t).sum())
+    if n_above + n_at != k:
+        problems.append("(c) #above tau + #at tau != k")
+    if n_above != len(above):
+        problems.append("(b) #selected above tau != #window above tau")
+    return problems

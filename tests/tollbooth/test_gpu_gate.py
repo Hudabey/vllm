@@ -555,6 +555,7 @@ class Expect:
     kth: float  # k-th largest live score inside the causal window (NaN if < k)
     row: int  # token row in the forward (index into the top-k buffer)
     unique_set: bool  # no tie at the k-th score: the top-k set is unique
+    window: np.ndarray | None = None  # f32 live scores of the causal window
 
 
 def expected_rows(
@@ -613,7 +614,10 @@ def expected_rows(
             prefix.cpu().numpy(),
         )
         kth_np = kth.cpu().numpy()
+        masked_np = masked.cpu().numpy()
+        ks_np = ks.cpu().numpy()
         for r in range(n):
+            w0 = int(ks_np[r])
             out.append(
                 Expect(
                     metas[r],
@@ -625,6 +629,7 @@ def expected_rows(
                     float(kth_np[r]),
                     row0 + r,
                     bool(unique_np[r]),
+                    window=masked_np[r, w0 : w0 + int(pre_np[r])].copy(),
                 )
             )
     assert ci == len(chunks), "every prefill chunk must have produced one logits call"
@@ -645,7 +650,7 @@ def check_records(
     assert len(got) == len(expects), (
         f"{len(got)} records vs {len(expects)} expected rows"
     )
-    tau_valid_rows = tau_nan_rows = tie_rows = 0
+    tau_valid_rows = tau_nan_rows = tie_rows = strict_rows = 0
     for e in expects:
         i = got[(e.meta.request_key, e.meta.query_position)]
         ids, sc = rec["ids"][i], rec["scores"][i]
@@ -682,6 +687,16 @@ def check_records(
             assert not (flags & dsa_trace.Flag.TAU_VALID)
             assert math.isnan(tau)
             tau_nan_rows += 1
+        # strict top-k validation against the live window (audit item 1/7):
+        # (a) selected score multiset == true top-k multiset, (b) every id
+        # strictly above tau selected, (c) #above + #at tau == k, (d) unique,
+        # in range, scores bitwise == window[ids], min == tau. Any choice among
+        # ids tied at tau passes; selecting a tied id in place of a strictly
+        # higher one fails.
+        if e.window is not None:
+            problems = dsa_trace.validate_topk_row(e.window, ids, sc, tau, K)
+            assert not problems, f"record {i}: {problems}"
+            strict_rows += 1
         assert bool(flags & dsa_trace.Flag.DECODE) == (
             e.phase == dsa_trace.Phase.DECODE
         )
@@ -695,6 +710,7 @@ def check_records(
         "tau_valid_rows": tau_valid_rows,
         "tau_nan_rows": tau_nan_rows,
         "tie_rows": tie_rows,
+        "strict_topk_rows": strict_rows,
     }
 
 
@@ -1320,3 +1336,191 @@ def test_overhead_writer_throughput(env, tmp_path_factory):
     }
     record_fact("overhead_writer", res)
     os.remove(session.records_path)  # 2.7 GB; the manifest stays
+
+
+# --------------------------------------------------------------------------- #
+# Audit fixes (2026-09-10): writer failure on CUDA, continuous benchmark
+# --------------------------------------------------------------------------- #
+
+
+def test_strict_topk_validator_counterexample():
+    """The [10, 9, 9], k=2 counterexample (selecting both 9s) must be rejected
+    and both legitimate boundary-tie choices accepted, on the same helper the
+    gate applies to every record."""
+    w = np.array([10.0, 9.0, 9.0], dtype=np.float32)
+    assert dsa_trace.validate_topk_row(w, [1, 2], [9.0, 9.0], 9.0, k=2)
+    assert dsa_trace.validate_topk_row(w, [0, 1], [10.0, 9.0], 9.0, k=2) == []
+    assert dsa_trace.validate_topk_row(w, [2, 0], [9.0, 10.0], 9.0, k=2) == []
+
+
+def test_gate_writer_failure_cuda(env, tmp_path_factory):
+    """Audit item 2 on CUDA: pinned ring of 1 slot x 200 rows, a 4096-row
+    capture split into 21 slots, and the 2nd records write raising OSError.
+    The producer must raise TraceContractError chained from the OSError in
+    bounded time (it was blocked on a free slot), close() must re-raise it
+    after writing the manifest, the writer thread must be dead, and the bytes
+    written before the failure must be intact."""
+    device = env.device
+    tdir = trace_dir(tmp_path_factory, "gate-writer-failure")
+    session = new_session(tdir, device, ring_slots=1, capacity_rows=200)
+    assert isinstance(session.ring.copy_stream, torch.cuda.Stream)
+    L = 4096
+    batch = make_batch(env, [], [L], seed=91, logits_mb="512", session=session)
+    chunk = batch.metadata.prefill.chunks[0]
+    buf = torch.full((L, K), -1, dtype=torch.int32, device=device)
+    ctx = dsa_trace.TraceContext(
+        run_id=1, step_id=0, tp_rank=0, tp_world_size=1, rows=batch.rows
+    )
+    with LogitsSpy() as spy:
+        kv = batch.layers[0].kv_cache_base.clone()
+        run_layer(env, batch, 0, kv, buf, None)
+    logits = spy.calls[0].logits
+    first_rows = buf[:200].clone()
+    real_write = session.records_fd.write
+    calls = {"n": 0}
+
+    def failing_write(b):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError(28, "No space left on device (injected)")
+        return real_write(b)
+
+    session.records_fd.write = failing_write  # type: ignore[method-assign]
+    t0 = time.perf_counter()
+    with pytest.raises(dsa_trace.TraceContractError) as ei:
+        for layer in range(8):
+            dsa_trace.capture_prefill_chunk((session, ctx), layer, logits, buf, chunk)
+    wall = time.perf_counter() - t0
+    assert wall < 10.0, f"producer not unblocked in bounded time ({wall:.1f}s)"
+    assert isinstance(ei.value.__cause__, OSError)
+    assert ei.value.__cause__.errno == 28
+    assert session.ring.failed is session.fatal
+    session.writer.join(10)
+    assert not session.writer.is_alive()
+    with pytest.raises(dsa_trace.TraceContractError) as ec:
+        session.close()
+    assert ec.value.__cause__ is session.fatal
+    torch.cuda.synchronize()
+    assert all(sl.state == dsa_trace.SlotState.FREE for sl in session.ring.slots)
+    rec = dsa_trace.read_records(session.records_path, K)
+    assert len(rec) == 200
+    assert np.array_equal(rec["ids"], first_rows.cpu().numpy())
+    assert rec["header"]["query_position"].tolist() == list(range(200))
+    manifest = json.load(open(session.manifest_path))
+    assert manifest["fatal"] and "injected" in manifest["fatal"]
+    record_fact(
+        "writer_failure_cuda",
+        {"wall_s": wall, "writes_before_failure": 1, "records_on_disk": 200,
+         "cause": repr(ei.value.__cause__)},
+    )
+
+
+BENCH_LAYERS = 61
+BENCH_STEPS = int(os.environ.get("TOLLBOOTH_BENCH_STEPS", "8"))
+
+
+@pytest.mark.parametrize("mode", ["full", "sampled"])
+def test_continuous_capture_benchmark(env, tmp_path_factory, mode):
+    """Audit item 4: BENCH_STEPS forward-steps x 61 indexer layers of a
+    realistic mixed batch (64 decode rows at L=4096 + one 4096-row prefill
+    chunk), real kernels every iteration, writer active with the default ring
+    (64 x MAX_TOKENS). Hook-off baseline first (same loop, no capture), then
+    hook-on. Reports producer wall, drain, records, bytes, writer throughput,
+    stalls, queue occupancy. SYNTHETIC inputs; one TP rank; TP=8 numbers are
+    extrapolations left to the report."""
+    device = env.device
+    smode = dsa_trace.SampleMode.parse(mode)
+    tdir = trace_dir(tmp_path_factory, f"bench-{mode}")
+    session = new_session(tdir, device, sample_mode=smode)
+    L = 4096
+    n_dec = 64
+    batch = make_batch(env, [L] * n_dec, [L], seed=500, logits_mb="512", session=session)
+    md = batch.metadata
+    assert md.num_decode_tokens == n_dec and len(md.prefill.chunks) == 1
+    T = batch.num_tokens
+    buf = torch.full((T, K), -1, dtype=torch.int32, device=device)
+    kv = {ly: batch.layers[ly].kv_cache_base.clone() for ly in LAYERS}
+
+    def one_step(step: int, trace_on: bool) -> None:
+        ctx = dsa_trace.TraceContext(
+            run_id=1, step_id=step, tp_rank=0, tp_world_size=1, rows=batch.rows
+        )
+        for layer in range(BENCH_LAYERS):
+            ly = layer % len(LAYERS)  # two real input sets, 61 layer ids
+            run_layer(env, batch, ly, kv[ly], buf, (session, ctx) if trace_on else None)
+
+    # warm-up (JIT, allocator)
+    one_step(-1, False)
+    torch.cuda.synchronize()
+    # hook-off baseline
+    t0 = time.perf_counter()
+    for step in range(BENCH_STEPS):
+        one_step(step, False)
+    torch.cuda.synchronize()
+    t_off = time.perf_counter() - t0
+    # hook-on: producer wall, then drain
+    stalls0 = session.ring.stalls
+    t1 = time.perf_counter()
+    for step in range(BENCH_STEPS):
+        one_step(step, True)
+    torch.cuda.synchronize()
+    t_on = time.perf_counter() - t1
+    session.flush()
+    t_flush = time.perf_counter() - t1
+    session.close()
+    t_close = time.perf_counter() - t1
+    rec_n = session.writer.records_written
+    nbytes = session.writer.bytes_written
+    captures = session.captures
+    occ = session.ring.occupancy()
+    rows_per_layer = n_dec + (
+        L if smode == dsa_trace.SampleMode.FULL
+        else len(session.sampled_prefill_rows(batch.rows[n_dec:], L))
+    )
+    assert rec_n == BENCH_STEPS * BENCH_LAYERS * rows_per_layer, (rec_n, rows_per_layer)
+    assert nbytes == rec_n * dsa_trace.record_size(K)
+    rec = dsa_trace.read_records(session.records_path, K)[:2000]
+    assert all(dsa_trace.sample_mode_of(int(f)) == smode for f in rec["header"]["flags"])
+    res = {
+        "synthetic": True,
+        "tp_ranks_measured": 1,
+        "mode": mode,
+        "steps": BENCH_STEPS,
+        "layers_per_step": BENCH_LAYERS,
+        "decode_rows": n_dec,
+        "prefill_rows_per_chunk": L,
+        "rows_captured_per_layer": rows_per_layer,
+        "captures": captures,
+        "records": rec_n,
+        "bytes": nbytes,
+        "hook_off_wall_s": t_off,
+        "producer_wall_s": t_on,
+        "capture_overhead_s": t_on - t_off,
+        "capture_overhead_us_per_capture": (t_on - t_off) / max(captures, 1) * 1e6,
+        "drain_after_producer_s": t_flush - t_on,
+        "total_to_flush_s": t_flush,
+        "total_to_close_s": t_close,
+        "writer_MB_per_s_over_total": nbytes / t_flush / 1e6,
+        "writer_MB_per_s_during_drain": (
+            None if t_flush - t_on < 1e-3 else None  # filled below
+        ),
+        "records_per_s": rec_n / t_flush,
+        "steps_per_s_hook_off": BENCH_STEPS / t_off,
+        "steps_per_s_hook_on_to_flush": BENCH_STEPS / t_flush,
+        "ring_stalls": session.ring.stalls - stalls0,
+        "ring_slots": len(session.ring.slots),
+        "ring_capacity_rows": session.ring.capacity_rows,
+        "ring_occupancy": occ,
+        "prefill_rows_seen": session.prefill_rows_seen,
+        "prefill_rows_captured": session.prefill_rows_captured,
+        "trace_dir": tdir,
+    }
+    # writer throughput while the producer was still running is not separable
+    # from the drain without per-write timestamps; report the drain rate.
+    if t_flush - t_on >= 1e-3:
+        bytes_after = nbytes - min(nbytes, int(nbytes * t_on / t_flush))
+        res["writer_MB_per_s_during_drain"] = bytes_after / (t_flush - t_on) / 1e6
+    record_fact(f"continuous_{mode}", res)
+    os.remove(session.records_path)  # tens of GB in full mode; manifest stays
+    del batch, kv
+    torch.cuda.empty_cache()
