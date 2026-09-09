@@ -865,6 +865,13 @@ def layer_index_from_name(layer_name: str) -> int:
     raise ValueError(f"no layer index in {layer_name!r}")
 
 
+_PLACEHOLDER_MSG = (
+    "tollbooth: request {rid} has a placeholder token id (-1) in the CPU token "
+    "array; the trace needs exact ids at row-build time, so async scheduling must "
+    "be disabled (LLM(..., async_scheduling=False))"
+)
+
+
 class RowBuilder:
     """Turns the model runner's per-forward batch layout into ``RowMeta`` rows.
 
@@ -907,7 +914,10 @@ class RowBuilder:
             if covered != c:
                 if covered > c:
                     attempt += 1
-                node = self.ledger.add(token_ids_cpu[i, :c]) if c > 0 else 0
+                prefix = token_ids_cpu[i, :c]
+                if c > 0 and int(prefix.min()) < 0:
+                    raise TraceContractError(_PLACEHOLDER_MSG.format(rid=rid))
+                node = self.ledger.add(prefix) if c > 0 else 0
             key = request_key(rid)
             self.request_keys.setdefault(key, rid)
             ph = self._prompt_hash.get(rid, "")
@@ -916,6 +926,8 @@ class RowBuilder:
                 self._prompt_hash[rid] = ph
                 self.prompt_hashes[key] = ph
             toks = token_ids_cpu[i, c : c + s]
+            if int(toks.min()) < 0:
+                raise TraceContractError(_PLACEHOLDER_MSG.format(rid=rid))
             path = self.ledger.add_path_from(node, toks)
             phase = Phase.DECODE if s <= decode_threshold else Phase.PREFILL
             for j in range(s):
@@ -941,6 +953,11 @@ def get_active() -> tuple[TraceSession, TraceContext] | None:
     """Layer-path lookup; None outside a traced forward (dummy runs, profiling,
     graph capture) so every call site degrades to a no-op."""
     return _ACTIVE
+
+
+def armed() -> bool:
+    """True when TOLLBOOTH_DIR is set, i.e. session_from_env would open a session."""
+    return bool(os.environ.get("TOLLBOOTH_DIR"))
 
 
 def session_from_env(

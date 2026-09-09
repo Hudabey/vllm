@@ -6667,6 +6667,12 @@ class GPUModelRunner(
         k = getattr(self.model_config.hf_text_config, "index_topk", None)
         if k is None:
             return
+        if self.vllm_config.scheduler_config.async_scheduling and dsa_trace.armed():
+            raise NotImplementedError(
+                "tollbooth: async scheduling leaves placeholder token ids (-1) in "
+                "the CPU token array at row-build time; run with "
+                "async_scheduling=False"
+            )
         tp = get_tp_group()
         self._tollbooth = dsa_trace.session_from_env(
             tp_rank=tp.rank_in_group,
