@@ -60,7 +60,7 @@ from vllm.forward_context import (
 from vllm.logger import init_logger
 from vllm.lora.layers import BaseLayerWithLoRA, LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers import dsa_trace
+from vllm.model_executor.layers import dsa_capture_ext, dsa_trace
 from vllm.version import __version__ as vllm_version
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
@@ -558,6 +558,8 @@ class GPUModelRunner(
         # tollbooth: exact DSA indexer selection trace (armed by TOLLBOOTH_DIR).
         self._tollbooth: dsa_trace.TraceSession | None = None
         self._tollbooth_rows: dsa_trace.RowBuilder | None = None
+        self._tollbooth_c2: dsa_capture_ext.C2Session | None = None
+        self._tollbooth_cache_access: dsa_capture_ext.RunnerCacheAccess | None = None
         self._tollbooth_step = 0
         self._tollbooth_checked = False
         self.max_num_reqs = scheduler_config.max_num_seqs
@@ -4575,6 +4577,11 @@ class GPUModelRunner(
             finally:
                 if tollbooth_ctx is not None:
                     dsa_trace.clear_active()
+            if tollbooth_ctx is not None and self._tollbooth_c2 is not None:
+                # C2 S3: host-side page snapshots / appended keys, after the forward,
+                # while this forward's block tables and row ownership are still current.
+                assert self._tollbooth_cache_access is not None
+                self._tollbooth_c2.post_forward(tollbooth_ctx, self._tollbooth_cache_access)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -6694,6 +6701,27 @@ class GPUModelRunner(
             self._tollbooth_rows = dsa_trace.RowBuilder(
                 self._tollbooth.ledger, self._tollbooth.request_keys
             )
+            self._tollbooth_c2 = dsa_capture_ext.c2_from_env(
+                self._tollbooth,
+                device=self.device,
+                max_model_len=self.model_config.max_model_len,
+                block_size=self.cache_config.block_size,
+            )
+            if self._tollbooth_c2 is not None:
+                self._tollbooth_cache_access = dsa_capture_ext.RunnerCacheAccess(
+                    self, self._tollbooth.request_keys
+                )
+                self._tollbooth_c2.manifest_extra = {
+                    "model": self.model_config.model,
+                    "vllm_version": vllm_version,
+                    "cache_block_size": self.cache_config.block_size,
+                }
+                logger.info(
+                    "tollbooth C2: queries=%s rows=%s pages=%s",
+                    self._tollbooth_c2.enable_queries,
+                    bool(self._tollbooth_c2.rows_spec),
+                    self._tollbooth_c2.enable_pages,
+                )
             logger.info(
                 "tollbooth: tracing DSA indexer selection to %s (rank %d, k=%d)",
                 self._tollbooth.out_dir,
@@ -6752,6 +6780,11 @@ class GPUModelRunner(
         memory is reclaimable when running in the same process."""
         if self._tollbooth is not None:
             try:
+                if self._tollbooth_c2 is not None:
+                    try:
+                        self._tollbooth_c2.close()
+                    finally:
+                        self._tollbooth_c2 = None
                 self._tollbooth.close()
             finally:
                 self._tollbooth = None

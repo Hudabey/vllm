@@ -694,15 +694,19 @@ class TraceSession:
         rows: slice | Sequence[int],
         phase: int = Phase.PREFILL,
         score_source: int = ScoreSource.SELECTOR,
-    ) -> None:
+    ) -> list[int]:
         """Record the selector output for ``logits``/``topk_indices`` rows.
 
         ``rows`` maps logits row i -> ctx.rows index (a slice for contiguous
         chunks, an explicit index list for padded decode rows). No-op when
         ``ctx`` is None (dummy / profiling / graph-capture runs).
+
+        Returns the indices (into the given logits rows) that were captured, so
+        that the C2 extension streams record exactly the same rows; [] when
+        nothing was captured.
         """
         if ctx is None:
-            return
+            return []
         if self.fatal is not None:
             raise TraceContractError("trace writer failed earlier") from self.fatal
         meta = ctx.rows[rows] if isinstance(rows, slice) else [ctx.rows[i] for i in rows]
@@ -710,12 +714,13 @@ class TraceSession:
         if len(meta) != n:
             raise ValueError(f"{n} logits rows but {len(meta)} row metas")
         if n == 0:
-            return
+            return []
+        keep: list[int] = list(range(n))
         if self.sample_mode == SampleMode.WINDOWED:
             self.window_rows_seen += n
             keep = self.windowed_rows(meta)
             if not keep:
-                return
+                return []
             if len(keep) < n:
                 idx = torch.tensor(keep, dtype=torch.int64, device=logits.device)
                 logits = logits.index_select(0, idx)
@@ -728,10 +733,10 @@ class TraceSession:
         elif phase == Phase.PREFILL and self.sample_mode != SampleMode.FULL:
             self.prefill_rows_seen += n
             if self.sample_mode == SampleMode.DECODE_ONLY:
-                return
+                return []
             keep = self.sampled_prefill_rows(meta, n)
             if len(keep) == 0:
-                return
+                return []
             if len(keep) < n:
                 idx = torch.tensor(keep, dtype=torch.int64, device=logits.device)
                 logits = logits.index_select(0, idx)
@@ -761,6 +766,7 @@ class TraceSession:
                 g.prefix_len[start:end])
             self.ring.submit(slot, part)
         self.captures += 1
+        return keep
 
     def windowed_rows(self, meta: Sequence[RowMeta]) -> list[int]:
         """Row indices whose request prompt hash has a window containing the row's
@@ -1001,6 +1007,40 @@ def session_from_env(
     )
 
 
+def _c2_after_capture(
+    session: TraceSession,
+    ctx: TraceContext,
+    layer_id: int,
+    keep: list[int],
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    rows: slice | Sequence[int],
+    phase: int,
+    q_quant: torch.Tensor | None,
+    weights: torch.Tensor | None,
+) -> None:
+    """C2 streams (queries / full rows) for exactly the rows ``capture`` kept."""
+    c2 = getattr(session, "c2", None)
+    if c2 is None or not keep:
+        return
+    meta_all = ctx.rows[rows] if isinstance(rows, slice) else [ctx.rows[i] for i in rows]
+    meta = [meta_all[i] for i in keep]
+    n_in = logits.shape[0]
+    if len(keep) < n_in:
+        idx = torch.tensor(keep, dtype=torch.int64, device=logits.device)
+        logits_k = logits.index_select(0, idx)
+        starts_k = row_starts.index_select(0, idx)
+        prefix_k = prefix_lens.index_select(0, idx)
+        q_k = q_quant.index_select(0, idx) if q_quant is not None else None
+        w_k = weights.index_select(0, idx) if weights is not None else None
+    else:
+        logits_k, starts_k, prefix_k, q_k, w_k = logits, row_starts, prefix_lens, q_quant, weights
+    if q_k is not None and w_k is not None:
+        c2.capture_queries(ctx, layer_id, q_k, w_k, meta, prefix_k, phase)
+    c2.capture_full_rows(ctx, layer_id, logits_k, starts_k, prefix_k, meta, phase)
+
+
 def capture_prefill_chunk(
     trace: tuple[TraceSession, TraceContext],
     layer_id: int,
@@ -1008,26 +1048,32 @@ def capture_prefill_chunk(
     topk_indices: torch.Tensor,
     chunk,
     score_source: int = ScoreSource.SELECTOR,
+    q_quant: torch.Tensor | None = None,
+    weights: torch.Tensor | None = None,
 ) -> None:
     """Call after the chunk's top-k (and any DCP merge). ``chunk`` is a
     DeepseekV32IndexerPrefillChunkMetadata: rows are token rows
     ``[token_start, token_end)``; ``cu_seqlen_ks/ke`` are per-row column bounds
-    of the causal window inside ``logits``."""
+    of the causal window inside ``logits``. ``q_quant``/``weights`` are the
+    chunk's rows of the kernel inputs (C2 S2 stream), optional."""
     session, ctx = trace
     n = chunk.token_end - chunk.token_start
     ks = chunk.cu_seqlen_ks[:n]
     ke = chunk.cu_seqlen_ke[:n]
-    session.capture(
+    rows = slice(chunk.token_start, chunk.token_end)
+    keep = session.capture(
         ctx,
         layer_id,
         logits,
         topk_indices,
         row_starts=ks,
         prefix_lens=ke - ks,
-        rows=slice(chunk.token_start, chunk.token_end),
+        rows=rows,
         phase=Phase.PREFILL,
         score_source=score_source,
     )
+    _c2_after_capture(session, ctx, layer_id, keep, logits, ks, ke - ks, rows,
+                      Phase.PREFILL, q_quant, weights)
 
 
 def capture_decode(
@@ -1038,11 +1084,14 @@ def capture_decode(
     seq_lens: torch.Tensor,
     num_decode_tokens: int,
     requires_padding: bool,
+    q_quant: torch.Tensor | None = None,
+    weights: torch.Tensor | None = None,
 ) -> None:
     """Call after the decode selector dispatch (and any DCP merge), before any
     unpack. Decode rows are the first ``num_decode_tokens`` token rows of the
     forward. Decode indices are request-local already, so row_starts = 0 and
-    prefix_lens = seq_lens (per row; 1-D (B,) or 2-D (B, next_n) flattened)."""
+    prefix_lens = seq_lens (per row; 1-D (B,) or 2-D (B, next_n) flattened).
+    ``q_quant``/``weights`` are the decode rows of the kernel inputs (C2 S2)."""
     if num_decode_tokens <= 0:
         return
     if requires_padding:
@@ -1054,17 +1103,21 @@ def capture_decode(
     session, ctx = trace
     n = num_decode_tokens
     prefix = seq_lens.reshape(-1)[:n]
-    session.capture(
+    starts = torch.zeros(n, dtype=torch.int32, device=logits.device)
+    keep = session.capture(
         ctx,
         layer_id,
         logits[:n],
         topk_indices[:n],
-        row_starts=torch.zeros(n, dtype=torch.int32, device=logits.device),
+        row_starts=starts,
         prefix_lens=prefix,
         rows=slice(0, n),
         phase=Phase.DECODE,
         score_source=ScoreSource.SELECTOR,
     )
+    _c2_after_capture(session, ctx, layer_id, keep, logits[:n], starts, prefix, slice(0, n),
+                      Phase.DECODE, None if q_quant is None else q_quant[:n],
+                      None if weights is None else weights[:n])
 
 
 # --------------------------------------------------------------------------- #

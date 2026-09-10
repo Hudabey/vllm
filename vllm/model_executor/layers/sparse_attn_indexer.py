@@ -656,7 +656,9 @@ def sparse_attn_indexer(
             )
             if trace is not None:
                 dsa_trace.capture_prefill_chunk(
-                    trace, trace_layer, logits, topk_indices, chunk
+                    trace, trace_layer, logits, topk_indices, chunk,
+                    q_quant=q_slice,
+                    weights=weights[chunk.token_start : chunk.token_end],
                 )
 
     if has_decode:
@@ -816,6 +818,8 @@ def sparse_attn_indexer(
                 seq_lens,
                 num_decode_tokens,
                 decode_metadata.requires_padding,
+                q_quant=q_quant[:num_decode_tokens],
+                weights=weights[:num_decode_tokens],
             )
 
         if decode_metadata.requires_padding:
