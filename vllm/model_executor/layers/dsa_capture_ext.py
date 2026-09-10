@@ -319,6 +319,8 @@ class C2Session:
         pin_memory: bool | None = None,
         page_bytes: int = 64 * KEY_BYTES,
         block_size: int = 64,
+        layers: set[int] | None = None,
+        pages_hash_only: bool = False,
     ) -> None:
         self.base = base
         self.out_dir = base.out_dir
@@ -331,6 +333,8 @@ class C2Session:
         self.enable_pages = bool(pages)
         self.block_size = int(block_size)
         self.page_bytes = int(page_bytes)
+        self.layers: set[int] | None = None if layers is None else {int(l) for l in layers}  # S2/S4 layer filter
+        self.pages_hash_only = bool(pages_hash_only)  # S3: hashes only, no page bytes (rank-1 spot check)
         self.max_model_len = int(max_model_len)
         cap = capacity_bytes or max(8 << 20, max_model_len * 4)
         self.ring = ExtRing(num_slots, cap, self.device, pin_memory)
@@ -371,7 +375,7 @@ class C2Session:
         prefix_lens: torch.Tensor,  # int32 [n]
         phase: int,
     ) -> None:
-        if not self.enable_queries:
+        if not self.enable_queries or (self.layers is not None and int(layer_id) not in self.layers):
             return
         self._check()
         n = len(meta)
@@ -442,7 +446,7 @@ class C2Session:
         values of ``row_starts``/``prefix_lens`` when the caller has them (the
         prefill chunk metadata does); without them one bounded .tolist() is done
         for the wanted rows only (never for rows nobody asked for)."""
-        if not self.rows_spec:
+        if not self.rows_spec or (self.layers is not None and int(layer_id) not in self.layers):
             return
         self._check()
         want = self.wanted_rows(meta)
@@ -551,20 +555,23 @@ class C2Session:
             lay = entry["layers"].setdefault(str(layer_id), {})
             if which == "A":
                 fn = f"{ph}.L{layer_id}.A.pages"
-                with open(os.path.join(self.pages_dir, fn), "wb") as f:
-                    f.write(pages.tobytes())
-                lay["A"] = {"file": os.path.join("pages", fn), "bytes": int(pages.nbytes), "pages": len(phys),
+                if not self.pages_hash_only:
+                    with open(os.path.join(self.pages_dir, fn), "wb") as f:
+                        f.write(pages.tobytes())
+                lay["A"] = {"file": None if self.pages_hash_only else os.path.join("pages", fn),
+                            "bytes": 0 if self.pages_hash_only else int(pages.nbytes), "pages": len(phys),
                             "positions_covered": int(npos), "physical_pages": phys.tolist(),
                             "last_page_fill": int(npos - (len(phys) - 1) * self.block_size),
                             "sha256_pages": hashes, "step_id": step_id}
-                self.stats["pages_bytes"] += int(pages.nbytes)
+                self.stats["pages_bytes"] += 0 if self.pages_hash_only else int(pages.nbytes)
             else:
                 keep = sorted(b for b in win_blocks if b < len(phys))
                 fn = f"{ph}.L{layer_id}.B.window.pages"
-                data = b"".join(pages[b].tobytes() for b in keep)
-                with open(os.path.join(self.pages_dir, fn), "wb") as f:
-                    f.write(data)
-                lay["B"] = {"file": os.path.join("pages", fn), "bytes": len(data), "pages": len(phys),
+                data = b"" if self.pages_hash_only else b"".join(pages[b].tobytes() for b in keep)
+                if not self.pages_hash_only:
+                    with open(os.path.join(self.pages_dir, fn), "wb") as f:
+                        f.write(data)
+                lay["B"] = {"file": None if self.pages_hash_only else os.path.join("pages", fn), "bytes": len(data), "pages": len(phys),
                             "positions_covered": int(npos), "physical_pages": phys.tolist(),
                             "window_logical_pages": keep, "sha256_pages": hashes, "step_id": step_id}
                 self.stats["pages_bytes"] += len(data)
@@ -600,6 +607,8 @@ class C2Session:
             "block_size": self.block_size,
             "page_layout": "64 x 128 e4m3 values, then 64 fp32 scales (indexer_k_quant_and_cache)",
             "rows_spec": {k: sorted(v) for k, v in self.rows_spec.items()},
+            "layers": None if self.layers is None else sorted(self.layers),
+            "pages_hash_only": self.pages_hash_only,
             "rows": self.rows_written,
             "pages": self.pages_manifest,
             "stats": self.stats,
@@ -698,9 +707,24 @@ class RunnerCacheAccess(CacheAccess):
 
 def c2_from_env(base: dsa_trace.TraceSession, device: torch.device | str, max_model_len: int,
                 block_size: int = 64) -> C2Session | None:
-    queries = os.environ.get("TOLLBOOTH_C2", "") not in ("", "0", "false")
-    pages = os.environ.get("TOLLBOOTH_PAGES", "") not in ("", "0", "false")
-    rows_path = os.environ.get("TOLLBOOTH_ROWS")
+    """TOLLBOOTH_C2 / TOLLBOOTH_PAGES / TOLLBOOTH_ROWS arm every rank identically.
+    TOLLBOOTH_C2_SPEC=<json> arms per rank instead: {"<tp_rank>": {"queries": bool,
+    "pages": bool, "pages_hash_only": bool, "rows": <path or null>, "layers": [..] or null}};
+    ranks absent from the spec get no C2 session (the brief's S5: rank 1 = layers 0 and 42
+    for S2/S4, page hashes only)."""
+    spec_path = os.environ.get("TOLLBOOTH_C2_SPEC")
+    if spec_path:
+        with open(spec_path) as f:
+            spec = json.load(f)
+        cfg = spec.get(str(base.tp_rank))
+        if not cfg:
+            return None
+        queries = bool(cfg.get("queries", False)); pages = bool(cfg.get("pages", False))
+        rows_path = cfg.get("rows"); layers = cfg.get("layers"); hash_only = bool(cfg.get("pages_hash_only", False))
+    else:
+        queries = os.environ.get("TOLLBOOTH_C2", "") not in ("", "0", "false")
+        pages = os.environ.get("TOLLBOOTH_PAGES", "") not in ("", "0", "false")
+        rows_path = os.environ.get("TOLLBOOTH_ROWS"); layers = None; hash_only = False
     rows_spec = None
     if rows_path:
         with open(rows_path) as f:
@@ -709,7 +733,8 @@ def c2_from_env(base: dsa_trace.TraceSession, device: torch.device | str, max_mo
     if not (queries or pages or rows_spec):
         return None
     return C2Session(base, device=device, max_model_len=max_model_len, queries=queries,
-                     rows_spec=rows_spec, pages=pages, block_size=block_size)
+                     rows_spec=rows_spec, pages=pages, block_size=block_size,
+                     layers=None if layers is None else set(int(l) for l in layers), pages_hash_only=hash_only)
 
 
 def get_c2(session: dsa_trace.TraceSession) -> C2Session | None:
