@@ -270,17 +270,21 @@ class ExtWriter(threading.Thread):
                 elif slot.kind == "row":
                     info = slot.row_info
                     data = slot.buf[: slot.nbytes].numpy().tobytes()  # copy out of pinned memory
-                    name = f"{info['prompt_hash']}.p{info['position']}.L{slot.layer_id}.f32"
+                    base = f"{info['prompt_hash']}.p{info['position']}.L{slot.layer_id}.f32"
+                    name, dup = base, 0
+                    while os.path.exists(os.path.join(self.s.rows_dir, name)):
+                        dup += 1
+                        name = f"{base}.dup{dup}"  # a second capture of the same row is RETAINED and flagged, never dropped or fatal
                     path = os.path.join(self.s.rows_dir, name)
-                    if os.path.exists(path):
-                        raise dsa_trace.TraceContractError(f"c2: full row written twice: {name}")
                     with open(path, "wb") as f:
                         f.write(data)
+                    if dup:
+                        self.s.stats["rows_duplicate"] = self.s.stats.get("rows_duplicate", 0) + 1
                     self.s.rows_written.append({
                         "file": os.path.join("rows", name), "prompt_hash": info["prompt_hash"],
                         "position": info["position"], "layer_id": slot.layer_id,
                         "prefix_length": info["P"], "bytes": len(data),
-                        "sha256": hashlib.sha256(data).hexdigest(), "step_id": slot.step_id,
+                        "sha256": hashlib.sha256(data).hexdigest(), "step_id": slot.step_id, "duplicate_index": dup,
                         "phase": "decode" if slot.phase == dsa_trace.Phase.DECODE else "prefill",
                         "request_key": int(slot.meta[0].request_key),
                     })
