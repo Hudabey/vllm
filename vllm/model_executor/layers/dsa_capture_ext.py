@@ -270,7 +270,7 @@ class ExtWriter(threading.Thread):
                 elif slot.kind == "row":
                     info = slot.row_info
                     data = slot.buf[: slot.nbytes].numpy().tobytes()  # copy out of pinned memory
-                    base = f"{info['prompt_hash']}.p{info['position']}.L{slot.layer_id}.f32"
+                    base = f"{info['prompt_hash']}.p{info['position']}.L{slot.layer_id}.r{self.s.tp_rank}.f32"
                     name, dup = base, 0
                     while os.path.exists(os.path.join(self.s.rows_dir, name)):
                         dup += 1
@@ -507,6 +507,7 @@ class C2Session:
                 raise dsa_trace.TraceContractError(f"c2: request {ph[:8]} needs {nblocks} blocks, table has {len(bt)}")
             phys = bt[:nblocks].astype(np.int64)
             entry = self.pages_manifest.setdefault(ph, {"request_key": int(key), "layers": {}, "appended": [],
+                                                        "appended_file": f"{ph}.r{self.tp_rank}.appended.records",
                                                         "block_size": self.block_size, "page_bytes": self.page_bytes})
             if ph not in self._pages_a_done:
                 self._snapshot(ph, phys, npos, cache_access, entry, "A", ctx.step_id)
@@ -524,7 +525,7 @@ class C2Session:
                     scale = page[self.block_size * HEAD_DIM + off * 4 : self.block_size * HEAD_DIM + (off + 1) * 4]
                     keys.append((layer_id, torch.cat([vals, scale]).cpu().numpy().tobytes()))
                 data = b"".join(k for _, k in keys)
-                fn = f"{ph}.appended.records"
+                fn = f"{ph}.r{self.tp_rank}.appended.records"
                 with open(os.path.join(self.pages_dir, fn), "ab") as f:
                     hdr = np.zeros(1, dtype=dsa_trace.HEADER_DTYPE)
                     hdr["run_id"] = self.run_id; hdr["step_id"] = ctx.step_id; hdr["request_key"] = m.request_key
@@ -538,8 +539,10 @@ class C2Session:
                 self.stats["appended_keys"] += 1
                 self.stats["pages_bytes"] += HEADER_SIZE + len(data)
             # snapshot B at the request's last captured position (window end)
+            # snapshot B at the last EXECUTED captured position: a decode window's end position is the
+            # request's final forced token, which is emitted and never fed, so trigger at end-1 as well
             ends = [b for a, b in self.base.windows.get(ph, [])]
-            if ends and ph not in self._pages_b_done and any(m.query_position == max(ends) for m in metas):
+            if ends and ph not in self._pages_b_done and any(m.query_position in (max(ends), max(ends) - 1) for m in metas):
                 self._snapshot(ph, phys, npos, cache_access, entry, "B", ctx.step_id)
                 self._pages_b_done.add(ph)
 
@@ -558,7 +561,7 @@ class C2Session:
             hashes = [hashlib.sha256(pages[i].tobytes()).hexdigest() for i in range(len(phys))]
             lay = entry["layers"].setdefault(str(layer_id), {})
             if which == "A":
-                fn = f"{ph}.L{layer_id}.A.pages"
+                fn = f"{ph}.L{layer_id}.r{self.tp_rank}.A.pages"
                 if not self.pages_hash_only:
                     with open(os.path.join(self.pages_dir, fn), "wb") as f:
                         f.write(pages.tobytes())
@@ -570,7 +573,7 @@ class C2Session:
                 self.stats["pages_bytes"] += 0 if self.pages_hash_only else int(pages.nbytes)
             else:
                 keep = sorted(b for b in win_blocks if b < len(phys))
-                fn = f"{ph}.L{layer_id}.B.window.pages"
+                fn = f"{ph}.L{layer_id}.r{self.tp_rank}.B.window.pages"
                 data = b"" if self.pages_hash_only else b"".join(pages[b].tobytes() for b in keep)
                 if not self.pages_hash_only:
                     with open(os.path.join(self.pages_dir, fn), "wb") as f:
