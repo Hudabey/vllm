@@ -356,6 +356,7 @@ class LogitsCall:
     ks: torch.Tensor | None = None
     ke: torch.Tensor | None = None
     seq_lens: torch.Tensor | None = None
+    ptr: int = 0  # data_ptr of the LIVE logits buffer (C2 ownership evidence)
 
 
 class LogitsSpy:
@@ -375,14 +376,14 @@ class LogitsSpy:
         def prefill(q, kv, weights, ks, ke, clean_logits):
             out = real_prefill(q, kv, weights, ks, ke, clean_logits=clean_logits)
             self.calls.append(
-                LogitsCall("prefill", out.clone(), ks=ks.clone(), ke=ke.clone())
+                LogitsCall("prefill", out.clone(), ks=ks.clone(), ke=ke.clone(), ptr=out.data_ptr())
             )
             return out
 
         def decode(q, kv_cache, weights, seq_lens, *args, **kwargs):
             out = real_decode(q, kv_cache, weights, seq_lens, *args, **kwargs)
             self.calls.append(
-                LogitsCall("decode", out.clone(), seq_lens=seq_lens.clone())
+                LogitsCall("decode", out.clone(), seq_lens=seq_lens.clone(), ptr=out.data_ptr())
             )
             return out
 
